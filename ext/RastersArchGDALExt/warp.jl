@@ -14,22 +14,38 @@ function warp(st::AbstractRasterStack, flags::Dict; filename=nothing, suffix=key
     RA.mapargs((A, s) -> warp(A, flags; filename, suffix=s), st, suffix; kw...)
 end
 
-function _warp(A::AbstractRaster, flags::Dict; filename=nothing, suffix="", kw...)
+function _warp(A::AbstractRaster, flags::Dict; 
+    filename=nothing, 
+    suffix="", 
+    missingval=Rasters.missingval(A),
+    name=Rasters.name(A),
+    kw...
+)
     A1 = _set_gdalwarp_sampling(A)
     filename = RA._maybe_add_suffix(filename, suffix)
     flagvect = reduce([flags...]; init=String[]) do acc, (key, val)
         append!(acc, String[_asflag(key), _stringvect(val)...])
     end
+    # TODO: detect if `A` already holds a lazy GDAL FileArray. 
+    # If it does, we can just open it and use it directly.
     tempfile = isnothing(filename) ? nothing : tempname() * ".tif"
     warp_kw = isnothing(filename) || filename == "/vsimem/tmp" ? () : (; dest=filename)
-    out = AG.Dataset(A1; filename=tempfile, kw...) do dataset
+    mv = if missingval isa Pair 
+        missingval[1]
+    else
+        missingval isa eltype(A) ? missingval : Rasters._type_missingval(eltype(A))
+    end
+    # We really need a missingval for `warp`, as it may rotate and add missing values
+    out = AG.Dataset(A1; filename=tempfile, missingval=mv, kw...) do dataset
         AG.gdalwarp([dataset], flagvect; warp_kw...) do warped
+            mv1, mv2 = RA._read_missingval_pair(warped, NoMetadata(), missingval)
             # Read the raster lazily, dropping Band if there is none in `A`
-            raster = Raster(warped; lazy=true, dropband=!hasdim(A, Band()), name = name(A))
+            raster = Raster(warped; lazy=true, dropband=!hasdim(A, Band()), name, missingval=mv1 => mv2)
             # Either read the MEM dataset to an Array, or keep a filename base raster lazy
             return isnothing(filename) ? read(raster) : raster
         end
     end
+
     # And permute the dimensions back to what they were in A
     out1 = _maybe_restore_from_gdal(out, dims(A))
     out2 = _reset_gdalwarp_sampling(out1, A)
